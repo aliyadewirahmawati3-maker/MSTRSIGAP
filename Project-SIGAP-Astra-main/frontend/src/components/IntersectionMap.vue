@@ -1,9 +1,22 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import SimulationVehicle from './SimulationVehicle.vue'
 import { colors, flows, motionPaths } from '../simulation/mapGeometry.js'
 import { advanceSimulation, cancelEvp, createSimulation, DENSITIES, DIRECTIONS, LABELS, lightFor, queuedVehicles, requestEvp, setDensity, TIMING } from '../simulation/intersectionSimulator.js'
+
+const props = defineProps({
+  signalPhases: {
+    type: Array,
+    default: () => [],
+  },
+  activeEvp: {
+    type: Object,
+    default: null,
+  },
+})
+
+const emit = defineEmits(['evp-triggered', 'evp-cancelled', 'evp-completed'])
 
 const approaches = [
   { label: 'Barat', code: 'B', color: 'green', left: 'Utara', straight: 'Timur', right: 'Selatan', className: 'west' },
@@ -12,11 +25,25 @@ const approaches = [
   { label: 'Timur', code: 'T', color: 'orange', left: 'Selatan', straight: 'Barat', right: 'Utara', className: 'east' },
 ]
 const simulation = reactive(createSimulation())
+
+const configuredTimingText = computed(() => {
+  if (props.signalPhases && props.signalPhases.length >= 2) {
+    const ew = props.signalPhases.find(p => p.phase_code === 'PHASE_EW')
+    const ns = props.signalPhases.find(p => p.phase_code === 'PHASE_NS')
+    const ewSec = ew?.duration?.default_seconds || 30
+    const nsSec = ns?.duration?.default_seconds || 25
+    const yellow = ew?.duration?.amber_seconds || 3
+    const allRed = ew?.duration?.all_red_seconds || 2
+    return `Parameter DB: Hijau B–T ${ewSec}s / U–S ${nsSec}s · Kuning ${yellow}s · All-Red ${allRed}s`
+  }
+  return `Hijau ${TIMING.green} dtk / kuning ${TIMING.yellow} dtk / all-red ≥ ${TIMING.allRed} dtk`
+})
 const emergencyKind = ref('ambulance')
 const emergencyDirection = ref('west')
 const pathsReady = ref(false)
 let frameId
 let previousTime = null
+let previousSimMode = 'normal'
 const phaseNames = { green: 'Hijau', yellow: 'Kuning', allRed: 'All-Red', red: 'Merah' }
 const emergencyNames = { ambulance: 'Ambulans', firetruck: 'Pemadam' }
 // Placed outside the road edges, clear of its markings and existing keys.
@@ -53,20 +80,64 @@ function togglePlay() {
   simulation.playing = !simulation.playing
 }
 function reset() {
+  if (simulation.evp) {
+    emit('evp-cancelled')
+  }
   Object.assign(simulation, createSimulation())
   emergencyKind.value = 'ambulance'
   emergencyDirection.value = 'west'
   previousTime = null
+  previousSimMode = 'normal'
 }
 function setSpeed(speed) {
   previousTime = null
   simulation.speed = speed
 }
 function clearFrameClock() { previousTime = null }
+
+function triggerEvpSimulation() {
+  const kind = emergencyKind.value
+  const direction = emergencyDirection.value
+  const ok = requestEvp(simulation, kind, direction)
+  if (ok) {
+    if (!simulation.playing) simulation.playing = true
+    emit('evp-triggered', {
+      vehicleType: kind,
+      direction: direction.toUpperCase(),
+    })
+  }
+}
+
+function cancelEvpSimulation() {
+  const ok = cancelEvp(simulation)
+  if (ok) {
+    emit('evp-cancelled')
+  }
+}
+
+watch(() => props.activeEvp, (newVal) => {
+  if (newVal && !simulation.evp) {
+    const kind = newVal.vehicle_type || 'ambulance'
+    const direction = (newVal.direction || 'west').toLowerCase()
+    emergencyKind.value = kind
+    emergencyDirection.value = direction
+    requestEvp(simulation, kind, direction)
+    if (!simulation.playing) simulation.playing = true
+  } else if (!newVal && simulation.evp && simulation.mode === 'preparing') {
+    cancelEvp(simulation)
+  }
+})
+
 function animate(time) {
   if (previousTime !== null && document.visibilityState === 'visible') {
     // Discard background-tab/stall time rather than jumping vehicles forward.
     advanceSimulation(simulation, Math.min((time - previousTime) / 1000, 0.1))
+
+    // Deteksi pemulihan EVP selesai kembali ke siklus normal
+    if (previousSimMode === 'recovering' && simulation.mode === 'normal') {
+      emit('evp-completed')
+    }
+    previousSimMode = simulation.mode
   }
   previousTime = time
   frameId = requestAnimationFrame(animate)
@@ -184,17 +255,17 @@ onBeforeUnmount(() => {
     <div class="phase-strip">
       <span><AppIcon name="traffic" :size="17" /><strong>Fase Aktif: {{ LABELS[simulation.direction] }}</strong><span :class="['phase-state', simulation.phase]">{{ phaseNames[simulation.phase] }}</span><b class="phase-countdown">{{ countdown }} dtk</b><span class="phase-simulator">· {{ simulation.playing ? 'Berjalan' : 'Pause' }}</span></span>
       <div class="phase-lights" aria-label="Status lampu setiap arah"><span v-for="direction in DIRECTIONS" :key="direction"><i :class="['status-dot', lightFor(simulation, direction)]"></i>{{ LABELS[direction] }} {{ phaseNames[lightFor(simulation, direction)] }}</span></div>
-      <p class="phase-detail">{{ simulation.phase === 'allRed' && countdown === 0 ? 'Menunggu kendaraan keluar dan jarak aman sebelum hijau berikutnya.' : `Dua lajur mengalir beriringan · Jarak aman antarkendaraan · Hijau ${TIMING.green} dtk / kuning ${TIMING.yellow} dtk / all-red ≥ ${TIMING.allRed} dtk` }}</p>
+      <p class="phase-detail">{{ simulation.phase === 'allRed' && countdown === 0 ? 'Menunggu kendaraan keluar dan jarak aman sebelum hijau berikutnya.' : `Dua lajur mengalir beriringan · Jarak aman antarkendaraan · ${configuredTimingText}` }}</p>
     </div>
     <div class="map-footnote"><AppIcon name="info" :size="13" />Warna jalur menunjukkan arah arus, bukan status lampu.</div>
     <section class="evp-panel" aria-labelledby="evp-title">
-      <div class="evp-heading"><h3 id="evp-title"><AppIcon name="shield" :size="15" />Emergency Vehicle Priority</h3><span class="evp-local">Simulasi lokal</span></div>
+      <div class="evp-heading"><h3 id="evp-title"><AppIcon name="shield" :size="15" />Emergency Vehicle Priority</h3><span class="evp-local">Terintegrasi Backend &amp; Simulasi</span></div>
       <p class="evp-status" :class="{ 'evp-active': simulation.evp }" role="status">{{ evpStatus }}</p>
       <div class="evp-controls">
         <label>Jenis kendaraan<select v-model="emergencyKind" :disabled="Boolean(simulation.evp)"><option value="ambulance">Ambulans</option><option value="firetruck">Pemadam</option></select></label>
         <label>Arah asal<select v-model="emergencyDirection" :disabled="Boolean(simulation.evp)"><option v-for="direction in DIRECTIONS" :key="direction" :value="direction">{{ LABELS[direction] }}</option></select></label>
-        <button type="button" class="evp-activate" :disabled="Boolean(simulation.evp)" @click="requestEvp(simulation, emergencyKind, emergencyDirection)">Aktifkan Simulasi EVP</button>
-        <button type="button" :disabled="simulation.mode !== 'preparing'" @click="cancelEvp(simulation)">Batalkan Simulasi EVP</button>
+        <button type="button" class="evp-activate" :disabled="Boolean(simulation.evp)" @click="triggerEvpSimulation">Aktifkan Simulasi EVP</button>
+        <button type="button" :disabled="simulation.mode !== 'preparing'" @click="cancelEvpSimulation">Batalkan Simulasi EVP</button>
       </div>
       <p class="evp-detail">{{ evpDetail }}<span v-if="!simulation.playing"> Tekan Play untuk menjalankan simulasi.</span></p>
       <p class="evp-future">Pada tahap lanjutan, pemicu EVP berasal dari hasil deteksi YOLO pada CCTV.</p>
